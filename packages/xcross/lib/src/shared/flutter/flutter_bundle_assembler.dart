@@ -382,10 +382,8 @@ final class FlutterBundleAssembler<T extends PlatformHostInterface>
     // keys see already-substituted values from the template, and before
     // storyboard stripping so $(VAR)-valued storyboard names are resolved
     // before the .storyboardc filesystem probe.
-    plistXml = InfoPlist.expandXmlVars(
-      plistXml,
-      await buildSubstitutionMap(sdkName: sdkName),
-    );
+    final substitutions = await buildSubstitutionMap(sdkName: sdkName);
+    plistXml = InfoPlist.expandXmlVars(plistXml, substitutions);
     if (options.buildName != null ||
         !plistXml.contains('<key>CFBundleShortVersionString</key>')) {
       plistXml = PlistMutations.setPlistString(
@@ -430,6 +428,7 @@ final class FlutterBundleAssembler<T extends PlatformHostInterface>
       bundleDir: bundleDir,
       deploymentTarget: deploymentTarget,
       resources: resources,
+      substitutions: substitutions,
     );
     plistXml = runtime.storyboards.stripUnsatisfiableStoryboards(
       plistXml,
@@ -459,15 +458,20 @@ final class FlutterBundleAssembler<T extends PlatformHostInterface>
     required String bundleDir,
     required IosDeploymentTarget deploymentTarget,
     required StagedIosResources resources,
+    required Map<String, String> substitutions,
   }) {
     final paths = runtime.host.paths.context;
     final launchName = AppResourceCompiler.launchStoryboardNameOf(plistXml);
+    final appIconName = resources.appIconName == null
+        ? null
+        : InfoPlist.expandVars(resources.appIconName!, substitutions);
+
     return runtime.resourceCompiler.compile(
       bundleDir: bundleDir,
       infoPlistXml: plistXml,
       catalogs: resources.assetCatalogs,
       deploymentTarget: deploymentTarget.version,
-      appIconName: resources.appIconName,
+      appIconName: appIconName,
       alternateAppIconNames: resources.alternateAppIconNames,
       includeAllAppIcons: resources.includeAllAppIcons,
       accentColorName: resources.accentColorName,
