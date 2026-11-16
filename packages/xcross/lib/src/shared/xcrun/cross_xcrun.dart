@@ -361,6 +361,21 @@ final class XcrunSdkCommand {
     String name, {
     required String? sysroot,
   }) async {
+    // Flutter's iOS native-assets pipeline invokes `xcrun strip` on
+    // Mach-O binaries. The host's GNU strip cannot process them.
+    if (name == 'strip') {
+      final llvmStrip = await toolchain.locateLlvmTool(
+        runner.host.paths.executableName('llvm-strip'),
+      );
+
+      if (llvmStrip != null) return llvmStrip;
+
+      errors.writeln(
+        'xcrun: llvm-strip is required to strip iOS Mach-O binaries.',
+      );
+      return null;
+    }
+
     final pathTool = await runner.which(name, useConfiguration: false);
     if (pathTool != null &&
         runner.host.paths.pathKey(pathTool) !=

@@ -17,7 +17,17 @@ abstract final class FlutterPackOperation {
     options.validate(
       supportsPrecompiledModes: runtime.policy.supportsPrecompiledModes,
     );
-    final bundleId = runtime.bundleIds.resolve(projectRoot);
+    final mode = options.buildMode.name;
+    final modeName = '${mode[0].toUpperCase()}${mode.substring(1)}';
+
+    final configuration = options.flavor == null
+        ? null
+        : '$modeName-${options.flavor}';
+
+    final bundleId = runtime.bundleIds.resolve(
+      projectRoot,
+      configuration: configuration,
+    );
     final workspace = SwiftPmWorkspace.forProject(
       projectRoot,
       policy: runtime.policy,

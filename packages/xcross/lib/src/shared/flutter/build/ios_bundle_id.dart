@@ -3,17 +3,10 @@ import 'dart:io';
 import 'package:cli_kit/shared/platform/platform_host.dart';
 import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
+import 'package:xcross/src/shared/flutter/build/pbxproj.dart';
 import 'package:xcross/src/shared/flutter/errors.dart';
 import 'package:xcross/src/shared/flutter/project/pbx_project_reader.dart';
 
-/// Resolves the iOS product bundle identifier the way Flutter tooling does on
-/// non-macOS hosts (no `xcodebuild -showBuildSettings`).
-///
-/// Order:
-///   1. Literal `CFBundleIdentifier` from `ios/Runner/Info.plist` (no `$`).
-///   2. `PRODUCT_BUNDLE_IDENTIFIER` of the *application* target in
-///      `ios/*.xcodeproj/project.pbxproj` (never an app extension target).
-///   3. First `PRODUCT_BUNDLE_IDENTIFIER` in the pbxproj (legacy fallback).
 @internal
 final class IosBundleId {
   IosBundleId(this.fileSystem, this.paths, this.projects);
@@ -22,7 +15,6 @@ final class IosBundleId {
   final p.Context paths;
   final PbxProjectReader projects;
 
-  /// Flutter's `_productBundleIdPattern` from `xcode_project.dart`.
   static final _productBundleIdPattern = RegExp(
     r'''^\s*PRODUCT_BUNDLE_IDENTIFIER\s*=\s*(["']?)(.*?)\1;\s*$''',
     multiLine: true,
@@ -34,25 +26,23 @@ final class IosBundleId {
 
   static const _applicationProductType = 'com.apple.product-type.application';
 
-  /// Resolve the bundle id for the Flutter project at [projectRoot].
-  ///
-  /// Throws [FlutterBuildError] when neither a literal plist value nor a
-  /// pbxproj `PRODUCT_BUNDLE_IDENTIFIER` can be found.
-  String resolve(String projectRoot) {
-    final fromPlist = _cfBundleIdentifierFromPlist(projectRoot);
-    if (fromPlist != null && !fromPlist.contains(r'$')) {
-      return fromPlist;
+  String resolve(String projectRoot, {String? configuration}) {
+    if (configuration == null) {
+      final fromPlist = _cfBundleIdentifierFromPlist(projectRoot);
+      if (fromPlist != null && !fromPlist.contains(r'$')) {
+        return fromPlist;
+      }
     }
 
-    final fromPbxproj = _productBundleIdFromPbxproj(projectRoot);
-    if (fromPbxproj != null && fromPbxproj.isNotEmpty) {
-      return fromPbxproj;
-    }
+    final fromPbxproj = _productBundleIdFromPbxproj(
+      projectRoot,
+      configuration: configuration,
+    );
+    if (fromPbxproj != null) return fromPbxproj;
 
     throw FlutterBuildError(
-      'Could not resolve iOS bundle identifier. Set CFBundleIdentifier in '
-      'ios/Runner/Info.plist, or PRODUCT_BUNDLE_IDENTIFIER in '
-      'ios/*.xcodeproj/project.pbxproj.',
+      'Could not resolve iOS bundle identifier'
+      '${configuration == null ? '' : ' for configuration "$configuration"'}.',
     );
   }
 
@@ -61,58 +51,205 @@ final class IosBundleId {
       paths.join(projectRoot, 'ios', 'Runner', 'Info.plist'),
     );
     if (!file.existsSync()) return null;
+
     final match = _cfBundleIdentifierPattern.firstMatch(
       file.readAsStringSync(),
     );
+
     final value = match?.group(1)?.trim();
-    if (value == null || value.isEmpty) return null;
-    return value;
+    return value == null || value.isEmpty ? null : value;
   }
 
-  String? _productBundleIdFromPbxproj(String projectRoot) {
-    final pbxprojPath = _findPbxproj(projectRoot);
-    if (pbxprojPath == null) return null;
-    final pbxproj = fileSystem.file(pbxprojPath);
+  String? _productBundleIdFromPbxproj(
+    String projectRoot, {
+    String? configuration,
+  }) {
+    final path = _findPbxproj(projectRoot);
+    if (path == null) return null;
 
-    // Projects with app extensions (share extensions, widgets, ...) declare
-    // several PRODUCT_BUNDLE_IDENTIFIERs, and the extension's often comes
-    // first in the file. Resolve through the application target when the
-    // project graph parses, and only then fall back to a first-match scan.
-    final fromAppTarget = _appTargetBundleId(pbxprojPath);
-    if (fromAppTarget != null) return fromAppTarget;
+    final structured = _appTargetBundleId(path, configuration: configuration);
+    if (structured != null) return structured;
 
-    final match = _productBundleIdPattern.firstMatch(
-      pbxproj.readAsStringSync(),
-    );
+    final source = fileSystem.file(path).readAsStringSync();
+
+    if (configuration != null) {
+      return _namedConfigurationBundleId(source, configuration);
+    }
+
+    final match = _productBundleIdPattern.firstMatch(source);
     return _clean(match?.group(2));
   }
 
-  /// Bundle id of the `com.apple.product-type.application` target, preferring
-  /// a target literally named `Runner`.
-  String? _appTargetBundleId(String pbxprojPath) {
+  String? _appTargetBundleId(String pbxprojPath, {String? configuration}) {
     final project = projects.parseFile(pbxprojPath);
     if (project == null) return null;
 
+    ({bool found, String? value}) lookup(
+      PbxObject? owner,
+      String configurationName,
+    ) {
+      if (owner == null) {
+        return (found: false, value: null);
+      }
+
+      final list = project.object(owner.string('buildConfigurationList'));
+
+      for (final id
+          in list?.stringList('buildConfigurations') ?? const <String>[]) {
+        final config = project.object(id);
+
+        if (config?.isa != 'XCBuildConfiguration' ||
+            config?.string('name') != configurationName) {
+          continue;
+        }
+
+        final raw = config!.map('buildSettings')['PRODUCT_BUNDLE_IDENTIFIER'];
+
+        return (found: true, value: raw is String ? _clean(raw) : null);
+      }
+
+      return (found: false, value: null);
+    }
+
+    final projectOwner = project.object(project.rootObjectId);
+
+    final inherited = configuration == null
+        ? projectOwner == null
+              ? null
+              : _clean(
+                  project.buildSetting(
+                    projectOwner,
+                    'PRODUCT_BUNDLE_IDENTIFIER',
+                  ),
+                )
+        : lookup(projectOwner, configuration).value;
+
     String? fallback;
+
     for (final target in project.nativeTargets) {
-      if (target.string('productType') != _applicationProductType) continue;
-      final bundleId = _clean(
-        project.buildSetting(target, 'PRODUCT_BUNDLE_IDENTIFIER'),
-      );
+      if (target.string('productType') != _applicationProductType) {
+        continue;
+      }
+
+      final String? targetValue;
+
+      if (configuration == null) {
+        targetValue = _clean(
+          project.buildSetting(target, 'PRODUCT_BUNDLE_IDENTIFIER'),
+        );
+      } else {
+        final selected = lookup(target, configuration);
+
+        if (!selected.found) continue;
+
+        targetValue = selected.value;
+      }
+
+      final bundleId = targetValue ?? inherited;
       if (bundleId == null) continue;
-      if (target.string('name') == 'Runner') return bundleId;
+
+      if (target.string('name') == 'Runner') {
+        return bundleId;
+      }
+
       fallback ??= bundleId;
     }
+
     return fallback;
+  }
+
+  // Fallback for projects whose complete pbxproj cannot be parsed.
+  // Parse only the XCBuildConfiguration section, where the flavor's
+  // PRODUCT_BUNDLE_IDENTIFIER is declared.
+
+  String? _namedConfigurationBundleId(String source, String configuration) {
+    const sections = [
+      'PBXNativeTarget',
+      'XCConfigurationList',
+      'XCBuildConfiguration',
+    ];
+
+    final contents = StringBuffer();
+
+    for (final section in sections) {
+      final begin = '/* Begin $section section */';
+      final end = '/* End $section section */';
+
+      final start = source.indexOf(begin);
+      if (start < 0) return null;
+
+      final finish = source.indexOf(end, start + begin.length);
+      if (finish < 0) return null;
+
+      contents.writeln(source.substring(start + begin.length, finish));
+    }
+
+    final PbxProject project;
+
+    try {
+      project = PbxProject.parse(
+        '{ objects = {\n$contents\n}; }',
+        projectDirectory: '',
+      );
+    } on FormatException catch (error) {
+      throw FlutterBuildError(
+        'Could not parse Xcode target configurations: $error',
+      );
+    }
+
+    final applicationIds = <String>{};
+    final runnerIds = <String>{};
+
+    for (final target in project.nativeTargets) {
+      if (target.string('productType') != _applicationProductType) {
+        continue;
+      }
+
+      final list = project.object(target.string('buildConfigurationList'));
+
+      for (final id
+          in list?.stringList('buildConfigurations') ?? const <String>[]) {
+        final config = project.object(id);
+
+        if (config == null ||
+            config.isa != 'XCBuildConfiguration' ||
+            config.string('name') != configuration) {
+          continue;
+        }
+
+        final raw = config.map('buildSettings')['PRODUCT_BUNDLE_IDENTIFIER'];
+
+        final bundleId = raw is String ? _clean(raw) : null;
+        if (bundleId == null) continue;
+
+        applicationIds.add(bundleId);
+
+        if (target.string('name') == 'Runner') {
+          runnerIds.add(bundleId);
+        }
+      }
+    }
+
+    final identifiers = runnerIds.isNotEmpty ? runnerIds : applicationIds;
+
+    if (identifiers.length > 1) {
+      throw FlutterBuildError(
+        'Ambiguous application bundle identifiers for '
+        '"$configuration": ${identifiers.join(', ')}',
+      );
+    }
+
+    return identifiers.isEmpty ? null : identifiers.single;
   }
 
   static String? _clean(String? raw) {
     final value = raw?.trim();
-    if (value == null || value.isEmpty || value.contains(r'$')) return null;
+    if (value == null || value.isEmpty || value.contains(r'$')) {
+      return null;
+    }
     return value;
   }
 
-  /// Prefer `Runner.xcodeproj`, otherwise the first `*.xcodeproj` under `ios/`.
   String? _findPbxproj(String projectRoot) {
     final iosPath = paths.join(projectRoot, 'ios');
     final iosDir = fileSystem.directory(iosPath);
@@ -123,11 +260,14 @@ final class IosBundleId {
 
     for (final entity in iosDir.listSync()) {
       if (entity is! Directory) continue;
+
       final name = paths.basename(entity.path);
       if (!name.endsWith('.xcodeproj')) continue;
-      final candidate = paths.join(iosPath, name, 'project.pbxproj');
+
+      final candidate = paths.join(entity.path, 'project.pbxproj');
       if (fileSystem.file(candidate).existsSync()) return candidate;
     }
+
     return null;
   }
 }

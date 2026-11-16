@@ -3,6 +3,7 @@ import 'package:meta/meta.dart';
 import 'package:xcross/src/shared/artifact/plist_mutations.dart';
 import 'package:xcross/src/shared/flutter/build/app_extension_builder.dart';
 import 'package:xcross/src/shared/flutter/build/info_plist.dart';
+import 'package:xcross/src/shared/flutter/build/ios_app_icon_stager.dart';
 import 'package:xcross/src/shared/flutter/build/ios_bundle_versions.dart';
 import 'package:xcross/src/shared/flutter/build/ios_deployment_target.dart';
 import 'package:xcross/src/shared/flutter/constants.dart';
@@ -186,6 +187,11 @@ final class FlutterBundleAssembler<T extends PlatformHostInterface>
       deploymentTarget: deploymentTarget,
       sdkName: sdkName,
     );
+    await IosAppIconStager.stage(
+      projectRoot: projectRoot,
+      bundleDir: bundleDir,
+      flavor: options.flavor,
+    );
     for (final binary in await runtime.signatures.refresh(bundleDir)) {
       runtime.runner.log.logTrace('refreshed ad-hoc signature of $binary');
     }
@@ -328,28 +334,66 @@ final class FlutterBundleAssembler<T extends PlatformHostInterface>
     if (hostGroups.isNotEmpty) {
       subs['CUSTOM_GROUP_ID'] = hostGroups.first;
     }
+    final paths = runtime.host.paths.context;
 
-    final flutterConfigDirectory = runtime.host.paths.context.join(
-      projectRoot,
-      'ios',
-      'Flutter',
+    final flutterConfigDirectory = paths.join(projectRoot, 'ios', 'Flutter');
+
+    final mode = options.buildMode.name;
+    final modeName = '${mode[0].toUpperCase()}${mode.substring(1)}';
+    final flavor = options.flavor;
+
+    final configuration = flavor == null ? modeName : '$modeName-$flavor';
+
+    final flavorConfig = flavor == null
+        ? null
+        : paths.join(flutterConfigDirectory, '$flavor$modeName.xcconfig');
+
+    final defaultConfig = paths.join(
+      flutterConfigDirectory,
+      '$modeName.xcconfig',
     );
+
+    final selectedConfig =
+        flavorConfig != null &&
+            runtime.host.fileSystem.file(flavorConfig).existsSync()
+        ? flavorConfig
+        : defaultConfig;
+
     final overrides = _buildVersionOverrides();
+
     subs.addAll(
       await runtime.xcconfigs.readDebugConfiguration(
-        debugPath: runtime.host.paths.context.join(
-          flutterConfigDirectory,
-          'Debug.xcconfig',
-        ),
-        generatedPath: runtime.host.paths.context.join(
-          flutterConfigDirectory,
-          'Generated.xcconfig',
-        ),
+        debugPath: selectedConfig,
+        generatedPath: paths.join(flutterConfigDirectory, 'Generated.xcconfig'),
+        configuration: configuration,
         sdk: selectedSdk,
         defaults: subs,
         overrides: overrides,
       ),
     );
+
+    final projectPath = runtime.projects.findPbxproj(projectRoot);
+
+    if (projectPath != null) {
+      final project = runtime.projects.parseFile(projectPath);
+      final target = project?.applicationTarget;
+
+      if (project != null && target != null) {
+        final settings = project.buildSettings(
+          target,
+          preferredConfiguration: configuration,
+        );
+        for (final entry in settings.entries) {
+          final value = entry.value;
+
+          if (value is String) {
+            subs[entry.key] = InfoPlist.expandVars(value, subs);
+          }
+        }
+      }
+    }
+
+    subs['PRODUCT_BUNDLE_IDENTIFIER'] = bundleId;
     subs.addAll(overrides);
 
     return subs;
