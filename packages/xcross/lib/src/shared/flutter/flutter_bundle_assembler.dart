@@ -548,21 +548,45 @@ final class FlutterBundleAssembler<T extends PlatformHostInterface>
       'Flutter',
     );
     final overrides = _buildVersionOverrides();
-    subs.addAll(
-      await runtime.xcconfigs.readDebugConfiguration(
-        debugPath: runtime.host.paths.context.join(
-          flutterConfigDirectory,
-          'Debug.xcconfig',
-        ),
-        generatedPath: runtime.host.paths.context.join(
-          flutterConfigDirectory,
-          'Generated.xcconfig',
-        ),
-        sdk: selectedSdk,
-        defaults: subs,
-        overrides: overrides,
-      ),
-    );
+    final configuration = _xcodeConfiguration;
+
+    final pbxproj = runtime.projects.findPbxproj(projectRoot);
+    final project = pbxproj == null
+        ? null
+        : runtime.projects.parseFile(pbxproj);
+    final target = project?.applicationTarget;
+
+    final baseConfigurationPaths = project == null || target == null
+        ? const <String>[]
+        : project.baseConfigurationPaths(
+            target,
+            preferredConfiguration: configuration,
+          );
+
+    final configured = baseConfigurationPaths.isEmpty
+        ? await runtime.xcconfigs.readDebugConfiguration(
+            debugPath: runtime.host.paths.context.join(
+              flutterConfigDirectory,
+              'Debug.xcconfig',
+            ),
+            generatedPath: runtime.host.paths.context.join(
+              flutterConfigDirectory,
+              'Generated.xcconfig',
+            ),
+            configuration: configuration,
+            sdk: selectedSdk,
+            defaults: subs,
+            overrides: overrides,
+          )
+        : await runtime.xcconfigs.readFiles(
+            baseConfigurationPaths,
+            configuration: configuration,
+            sdk: selectedSdk,
+            defaults: subs,
+            overrides: overrides,
+          );
+
+    subs.addAll(configured);
     subs.addAll(overrides);
 
     return subs;
